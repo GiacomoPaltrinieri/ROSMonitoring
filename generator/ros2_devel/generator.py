@@ -151,6 +151,7 @@ class MonitorGenerator():
         self.publish_topics = None
         self.topics_info = 'self.topics_info'
         self.services_info = 'self.services_info'
+        self.action_goals_info = 'self.action_goals'
         self.codegenutils = CodeGenAndROSUtils()
 
     # other helpful class related things 
@@ -191,20 +192,45 @@ class MonitorGenerator():
 
     def get_remapped_name(self, name):
         return name + "_mon"
+    #msg_or_srvtype dict{package, type}
+    #modifica il nome delle .action in modo usato da ROS2 (classe interna impl)
+    def get_runtime_type_expr(self, msg_or_srv_type):
+        package = msg_or_srv_type['package']
+        type_name = msg_or_srv_type['type']
+        if not package.endswith('.action'):
+            return type_name
+        if type_name.endswith('_FeedbackMessage'):
+            action_name = type_name[:-len('_FeedbackMessage')]
+            return action_name + ".Impl.FeedbackMessage"
+        if type_name.endswith('_SendGoal'):
+            action_name = type_name[:-len('_SendGoal')]
+            return action_name + ".Impl.SendGoalService"
+        if type_name.endswith('_GetResult'):
+            action_name = type_name[:-len('_GetResult')]
+            return action_name + ".Impl.GetResultService"
+        return type_name
+    # send goal, cancel, get result sono services, non serve modificare il qos.
+    # feedback è gia compatibile con il qos compatibile.
+    # Bisogna modificare il qos di status in quanto ROS 2 ne usa uno specifico. (https://design.ros2.org/articles/actions.html#:~:text=occur,The,-possible)
+    def get_topic_qos_expr(self, topic_name):
+        if topic_name.endswith('/_action/status'):
+            return 'qos_profile_action_status_default'
+        return str(self.queue_size)
 
     # functions that generate lines of code but not whole functions
     
     def create_subscriber_line(self,name,tinfo,tmsg_type,cbname):
         tpname = name
-        subtype = tmsg_type['type']
+        subtype = self.get_runtime_type_expr(tmsg_type)
+        qos_expr = self.get_topic_qos_expr(name)
         if tinfo['remapped']:
             tpname = self.get_remapped_name(name)
-        line = self.codegenutils.ros_subscriber_creation_command(tpname, subtype, cbname, self.queue_size)
+        line = self.codegenutils.ros_subscriber_creation_command(tpname, subtype, cbname, qos_expr)
         return line
     
     def create_server_service_line(self,name,sinfo,smsg_type,cbname):
         srvname = name
-        srvtype = smsg_type['type']
+        srvtype = self.get_runtime_type_expr(smsg_type)
         if sinfo['remapped']:
             srvname = self.get_remapped_name(name)
         line = self.codegenutils.ros_server_service_creation_command(srvname, srvtype, cbname)
@@ -228,8 +254,9 @@ class MonitorGenerator():
         tpname = name 
         if not tinfo['remapped']:
             tpname = self.get_remapped_name(tpname)
-        pubtype = tmsg_type['type']
-        line = self.codegenutils.ros_publisher_creation_command(tpname, pubtype, self.queue_size)
+        pubtype = self.get_runtime_type_expr(tmsg_type)
+        qos_expr = self.get_topic_qos_expr(name)
+        line = self.codegenutils.ros_publisher_creation_command(tpname, pubtype, qos_expr)
         return line
         
     def create_client_service_line(self, name, srvinfo, srvmsg_type):
@@ -238,7 +265,7 @@ class MonitorGenerator():
         srvname = name 
         if not srvinfo['remapped']:
             srvname = self.get_remapped_name(srvname)
-        srvtype = srvmsg_type['type']
+        srvtype = self.get_runtime_type_expr(srvmsg_type)
         line = self.codegenutils.ros_client_service_creation_command(srvname, srvtype)
         return line
     
@@ -284,7 +311,7 @@ class MonitorGenerator():
     def create_config_client_services_lines(self,services,srv_lists):
         lines = []
         for s in services:
-            srvline = "ServiceNode({srvtype},'{srvname}')".format(srvtype=srv_lists[s]['type'], srvname=s)
+            srvline = "ServiceNode({srvtype},'{srvname}')".format(srvtype=self.get_runtime_type_expr(srv_lists[s]), srvname=s)
             if srvline is not None:
                 line = "{config_srvs_dname}['{srvname}']={srvline}\n".format(config_srvs_dname=self.config_client_srvs_dict_name,srvname=s,srvline=srvline)
                 lines.append(line)
@@ -435,7 +462,7 @@ class MonitorGenerator():
         manylines = ["error = MonitorError()\n",
                      "error.m_topic = {0}['topic']\n".format(jsondict),
                      "error.m_time = {0}['time']\n".format(jsondict),
-                     "error.m_property = {0}['spec']\n".format(jsondict),
+                     "error.m_property = {0}.get('spec', '')\n".format(jsondict),
                      ]
         lines=self.codegenutils.append_lines_to_list_with_prefix(lines, manylines, lineprefix)
         
@@ -446,7 +473,7 @@ class MonitorGenerator():
             manylines = ["{jsond}_copy = {jsond}.copy()\n".format(jsond=jsondict),
                          "del {jsond}_copy['topic']\n".format(jsond=jsondict),
                          "del {jsond}_copy['time']\n".format(jsond=jsondict),
-                         "del {jsond}_copy['spec']\n".format(jsond=jsondict),
+                         "if 'spec' in {jsond}_copy: del {jsond}_copy['spec']\n".format(jsond=jsondict),
                          
                          # "del {jsond}_copy['error']\n".format(jsond=jsondict),
                          "error.m_content = json.dumps({jsond}_copy)\n".format(jsond=jsondict)
@@ -454,6 +481,15 @@ class MonitorGenerator():
             lines = self.codegenutils.append_lines_to_list_with_prefix(lines, manylines, lineprefix)
         line = "{monpubs}['error'].publish(error)\n".format(monpubs=self.mon_pubs_dict_name)
         lines.append(lineprefix+line)
+        #Quando arriva un feedback o status -> possono essere ricevuti più volte durante l'esecuzione di una action.
+        manylines = [
+            "if {jsond}.get('event_kind') == 'status' or {jsond}.get('event_kind') == 'feedback':\n".format(jsond=jsondict),
+        ]
+        lines = self.codegenutils.append_lines_to_list_with_prefix(lines, manylines, lineprefix) # aggiungo if sopra alla lista delle righe con indentazione
+        lineprefix = self.codegenutils.inc_indent(lineprefix) #incremento indentazione (ci troviamo nella condizione if)
+        manylines = self.create_cancel_action_topic_goal_lines(jsondict) # logica di cancel lato status e feedback
+        lines = self.codegenutils.append_lines_to_list_with_prefix(lines, manylines, lineprefix) #aggoungiamo la riga sopra di logica al monitor
+        lineprefix = self.codegenutils.dec_indent(lineprefix) # decremento indentazione (esco dall'if)
         line = "if verdict == 'false' and not {pt_var}:\n".format(pt_var=self.pub_topics_name)
         lines.append(lineprefix+line)
         lineprefix = self.codegenutils.inc_indent(lineprefix)
@@ -487,7 +523,7 @@ class MonitorGenerator():
         else:
             manylines = [   "del {jsond}['topic']\n".format(jsond=jsondict),
                          "del {jsond}['time']\n".format(jsond=jsondict),
-                         "del {jsond}['spec']\n".format(jsond=jsondict),
+                         "if 'spec' in {jsond}: del {jsond}['spec']\n".format(jsond=jsondict), #ripubblico solo i dati richiesti da ROS2, elimino i dati aggiunti da ROSMonitor
                          "if 'verdict' in {jsond}: del {jsond}['verdict']\n".format(jsond=jsondict)
                          # "del {jsond}['error']\n".format(jsond=jsondict)
                 ]
@@ -554,6 +590,8 @@ class MonitorGenerator():
 
         line = "{logging_fname}({data_dname})\n".format(logging_fname=self.logging_fname, data_dname=jsondict)
         lines.append(lineprefix+line)
+        manylines = self.create_track_cancel_request_lines(jsondict, "service") #aggiungo logica di cancellazione
+        lines = self.codegenutils.append_lines_to_list_with_prefix(lines, manylines, lineprefix) #scrivo logica di cancellazione sul monitor
         
         if not silent:
             msg = "'The request '+{data}+' is consistent, the service is called'".format(data = msg_input_var)
@@ -571,6 +609,8 @@ class MonitorGenerator():
         # lines.append(lineprefix + line)
         line = "{jsond}['response'] = rosidl_runtime_py.message_to_ordereddict(res)\n".format(jsond=jsondict)
         lines.append(lineprefix + line)
+        manylines = self.create_action_metadata_lines(jsondict, "service", 'response') # aggiuge dati relativi a una action ogni volta che riceve un messaggio relativo ad essa. quale action, fase action, quale goal.
+        lines = self.codegenutils.append_lines_to_list_with_prefix(lines, manylines, lineprefix)
         line = "{msgdict}[{jsond}['time']] = {input_varname}\n".format(msgdict=self.messages_dict_name, jsond=jsondict, input_varname='res')
         lines.append(lineprefix+line)
         lineprefix = self.codegenutils.dec_indent(lineprefix)
@@ -638,7 +678,7 @@ class MonitorGenerator():
         manylines = ["error = MonitorError()\n",
                      "error.m_service = {0}['service'].replace('_mon', '')\n".format(jsondict),
                      "error.m_time = {0}['time']\n".format(jsondict),
-                     "error.m_property = {0}['spec']\n".format(jsondict),
+                     "error.m_property = {0}.get('spec', '')\n".format(jsondict), # la action prevede più campi della service
                      ]
         lines=self.codegenutils.append_lines_to_list_with_prefix(lines, manylines, lineprefix)
         
@@ -681,6 +721,8 @@ class MonitorGenerator():
         lines.append(lineprefix+line)
         line = "{jsond}['response'] = rosidl_runtime_py.message_to_ordereddict(res)\n".format(jsond=jsondict)
         lines.append(lineprefix + line)
+        manylines = self.create_action_metadata_lines(jsondict, "service", 'response') # aggiugne dati alla service response
+        lines = self.codegenutils.append_lines_to_list_with_prefix(lines, manylines, lineprefix)
         lineprefix = self.codegenutils.dec_indent(lineprefix)
     
         oracle_response_varname = 'msg'
@@ -708,9 +750,29 @@ class MonitorGenerator():
         lines.append(lineprefix + line)
             
         lineprefix = self.codegenutils.dec_indent(lineprefix)
-        line = "else:\n"
+        line = "else:\n" #ci troviamo nel caso filter con proprietà violata
         lines.append(lineprefix + line)
         lineprefix = self.codegenutils.inc_indent(lineprefix)
+        line = "service = {jsond}['service'] = {jsond}['service'].replace('_mon', '')\n".format(jsond=jsondict) #eliminiamo il suffisso _mon
+        lines.append(lineprefix + line)
+        line = "if service.endswith('/_action/send_goal'):\n" # fase send goal, impedire inizio action prima che il mess arrivi al server
+        lines.append(lineprefix + line)
+        lineprefix = self.codegenutils.inc_indent(lineprefix)
+        line = "# Block start_action before it reaches the action server.\n"
+        lines.append(lineprefix + line)
+        line = "response_cls = eval({srv_info}[service]['type'] + '.Response')\n".format(srv_info=self.services_info) # prepariamo risposta da inviare al client senza necessità di passare dal server
+        lines.append(lineprefix + line)
+        line = "filtered_response = response_cls()\n"
+        lines.append(lineprefix + line)
+        line = "if hasattr(filtered_response, 'accepted'): filtered_response.accepted = False\n" # modifica stato accepted in false
+        lines.append(lineprefix + line) # per le action necessitiamo del campo accetped t/f
+        line = "if hasattr(filtered_response, 'stamp'): filtered_response.stamp = self.get_clock().now().to_msg()\n"
+        lines.append(lineprefix + line)
+        line = "return filtered_response\n" #return se topic .../_action/send_goal e proprietà violata.
+        lines.append(lineprefix + line)
+        lineprefix = self.codegenutils.dec_indent(lineprefix)
+        manylines = self.create_filter_cancel_goal_lines(jsondict, "service") #aggiunge logica risposta ROS2 a cancel
+        lines = self.codegenutils.append_lines_to_list_with_prefix(lines, manylines, lineprefix)
         line = "raise Exception('The request violates the monitor specification, so it has been filtered out.')\n\n"
         lines.append(lineprefix + line)
         lineprefix = self.codegenutils.dec_indent(lineprefix)
@@ -746,6 +808,10 @@ class MonitorGenerator():
         if not do_oracle:
             line = "del {data_dname}['verdict']\n".format(data_dname=jsondict)
             lines.append(lineprefix + line)
+        manylines = self.create_store_action_goal_lines(jsondict, "service")
+        lines = self.codegenutils.append_lines_to_list_with_prefix(lines, manylines, lineprefix)
+        manylines = self.create_finalize_action_goal_lines(jsondict, "service")
+        lines = self.codegenutils.append_lines_to_list_with_prefix(lines, manylines, lineprefix)
         line = "{logging_fname}({data_dname})\n".format(logging_fname=self.logging_fname, data_dname=jsondict)
         lines.append(lineprefix+line)
         
@@ -776,7 +842,7 @@ class MonitorGenerator():
         manylines = ["error = MonitorError()\n",
                      "error.m_service = {0}['service'].replace('_mon', '')\n".format(jsondict),
                      "error.m_time = {0}['time']\n".format(jsondict),
-                     "error.m_property = {0}['spec']\n".format(jsondict),
+                     "error.m_property = {0}.get('spec', '')\n".format(jsondict),
                      ]
         lines=self.codegenutils.append_lines_to_list_with_prefix(lines, manylines, lineprefix)
         
@@ -787,7 +853,7 @@ class MonitorGenerator():
             manylines = ["{jsond}_copy = {jsond}.copy()\n".format(jsond=jsondict),
                          "del {jsond}_copy['service']\n".format(jsond=jsondict),
                          "del {jsond}_copy['time']\n".format(jsond=jsondict),
-                         "del {jsond}_copy['spec']\n".format(jsond=jsondict),
+                         "if 'spec' in {jsond}_copy: del {jsond}_copy['spec']\n".format(jsond=jsondict),
                          
                          # "del {jsond}_copy['error']\n".format(jsond=jsondict),
                          "error.m_content = json.dumps({jsond}_copy)\n".format(jsond=jsondict)
@@ -814,11 +880,189 @@ class MonitorGenerator():
         line = "else:\n"
         lines.append(lineprefix + line)
         lineprefix = self.codegenutils.inc_indent(lineprefix)
+        manylines = self.create_cancel_action_goal_lines(jsondict, "service")
+        lines = self.codegenutils.append_lines_to_list_with_prefix(lines, manylines, lineprefix)
+        line = "if service.endswith('/_action/send_goal'):\n"
+        lines.append(lineprefix + line)
+        lineprefix = self.codegenutils.inc_indent(lineprefix)
+        line = "# Revoke start_action after acceptance when the oracle rejects the response.\n"
+        lines.append(lineprefix + line)
+        line = "response_cls = eval({srv_info}[service]['type'] + '.Response')\n".format(srv_info=self.services_info)
+        lines.append(lineprefix + line)
+        line = "filtered_response = response_cls()\n"
+        lines.append(lineprefix + line)
+        line = "if hasattr(filtered_response, 'accepted'): filtered_response.accepted = False\n"
+        lines.append(lineprefix + line)
+        line = "if hasattr(filtered_response, 'stamp'): filtered_response.stamp = self.get_clock().now().to_msg()\n"
+        lines.append(lineprefix + line)
+        line = "return filtered_response\n"
+        lines.append(lineprefix + line)
+        lineprefix = self.codegenutils.dec_indent(lineprefix)
+        manylines = self.create_filter_get_result_lines(jsondict, "service")
+        lines = self.codegenutils.append_lines_to_list_with_prefix(lines, manylines, lineprefix)
+        manylines = self.create_retry_cancel_goal_lines(jsondict, "service")
+        lines = self.codegenutils.append_lines_to_list_with_prefix(lines, manylines, lineprefix)
+        manylines = self.create_filter_cancel_goal_lines(jsondict, "service")
+        lines = self.codegenutils.append_lines_to_list_with_prefix(lines, manylines, lineprefix)
         line = "raise Exception('The request violates the monitor specification, so it has been filtered out.')\n\n"
         lines.append(lineprefix + line)
         lineprefix = self.codegenutils.dec_indent(lineprefix)
         
         self.codegenutils.check_indent("on message func done")    
+        return lines
+
+    #aggiunge dati in services che fanno parte di actions. 
+    #questi variano in base al tipo di richiesta/risposta (https://design.ros2.org/articles/actions.html#:~:text=Direction,message)
+    def create_action_metadata_lines(self, data_dict_name, service_expr, payload_key): # param 1. dizionario con dati evento (req/reply) 2. nome service -> /_action/cancel_goal 3. cosa stiamo analizzando (request | response)
+        lines = [
+            "if {service}.endswith('/_action/send_goal'):\n".format(service=service_expr), #se evento = send goal. il pacchetto contiene goal e goal_id (guarda link sopra)
+            "    {data}['event_kind'] = 'start_action_{payload}'\n".format(data=data_dict_name, payload=payload_key), #costruiamo stringa con start_action_(request|response) che permette all'oracolo di capire in che fase ci troviamo
+            "    {data}['action_name'] = {service}.replace('/_action/send_goal', '')\n".format(data=data_dict_name, service=service_expr), # estrapoliamo nome acion name dal service NomeAction/_action/send_goal -> NomeAction
+            "    if '{payload}' in {data} and isinstance({data}['{payload}'], dict) and 'goal_id' in {data}['{payload}']:\n".format(data=data_dict_name, payload=payload_key), # controllo che esista il payload, sia un dict, contenga goal id. l'if serve in caso di response in cui non abbiamo stessi dati
+            "        {data}['goal_id'] = {data}['{payload}']['goal_id']\n".format(data=data_dict_name, payload=payload_key), #aggiungo goal_id presente nella request
+            "        {data}['goal_id_key'] = json.dumps({data}['goal_id'], sort_keys=True)\n".format(data=data_dict_name), # creo chiave in formato JSON contenente il diz uuid che identifica action (necessitato dal monitor perchè non possiamo usare un diz come chiave di altro diz)
+            "elif {service}.endswith('/_action/get_result'):\n".format(service=service_expr),# se evento = get_result. pacchetto contiene goal_id
+            "    {data}['event_kind'] = 'get_result_{payload}'\n".format(data=data_dict_name, payload=payload_key), # necesitata da oracolo per capire fase action 
+            "    {data}['action_name'] = {service}.replace('/_action/get_result', '')\n".format(data=data_dict_name, service=service_expr),
+            "    if '{payload}' in {data} and isinstance({data}['{payload}'], dict) and 'goal_id' in {data}['{payload}']:\n".format(data=data_dict_name, payload=payload_key), #request e response hanno dati diversi
+            "        {data}['goal_id'] = {data}['{payload}']['goal_id']\n".format(data=data_dict_name, payload=payload_key),
+            "        {data}['goal_id_key'] = json.dumps({data}['goal_id'], sort_keys=True)\n".format(data=data_dict_name),
+            "elif {service}.endswith('/_action/cancel_goal'):\n".format(service=service_expr),
+            "    {data}['event_kind'] = 'cancel_action_{payload}'\n".format(data=data_dict_name, payload=payload_key),
+            "    {data}['action_name'] = {service}.replace('/_action/cancel_goal', '')\n".format(data=data_dict_name, service=service_expr),
+            "    if '{payload}' in {data} and isinstance({data}['{payload}'], dict) and 'goal_info' in {data}['{payload}'] and 'goal_id' in {data}['{payload}']['goal_info']:\n".format(data=data_dict_name, payload=payload_key),
+            "        {data}['goal_id'] = {data}['{payload}']['goal_info']['goal_id']\n".format(data=data_dict_name, payload=payload_key),
+            "        {data}['goal_id_key'] = json.dumps({data}['goal_id'], sort_keys=True)\n".format(data=data_dict_name),
+        ]
+        return lines
+    #aggiunge dati in topics che fanno parte di actions.
+    def create_action_topic_metadata_lines(self, data_dict_name, topic_expr):
+        lines = [
+            "if {topic}.endswith('/_action/status'):\n".format(topic=topic_expr), #caso status
+            "    {data}['event_kind'] = 'status'\n".format(data=data_dict_name), # per oracolo per capire fase action
+            "    {data}['action_name'] = {topic}.replace('/_action/status', '')\n".format(data=data_dict_name, topic=topic_expr), #estrae nome action
+            "    {data}['goal_ids'] = [status['goal_info']['goal_id'] for status in {data}['status_list'] if isinstance(status, dict) and 'goal_info' in status and isinstance(status['goal_info'], dict) and 'goal_id' in status['goal_info']]\n".format(data=data_dict_name), # list of in-progress goals with goal ID, time accepted, and an enum indicating the status. più goal, più id
+            "    {data}['goal_id_keys'] = [json.dumps(goal_id, sort_keys=True) for goal_id in {data}['goal_ids']]\n".format(data=data_dict_name), #trasforma in JSON elementi del diz sopra
+            "elif {topic}.endswith('/_action/feedback'):\n".format(topic=topic_expr),
+            "    {data}['event_kind'] = 'feedback'\n".format(data=data_dict_name),
+            "    {data}['action_name'] = {topic}.replace('/_action/feedback', '')\n".format(data=data_dict_name, topic=topic_expr),
+            "    if 'goal_id' in {data}:\n".format(data=data_dict_name),
+            "        {data}['goal_id'] = {data}['goal_id']\n".format(data=data_dict_name),
+            "        {data}['goal_id_key'] = json.dumps({data}['goal_id'], sort_keys=True)\n".format(data=data_dict_name),
+        ]
+        return lines
+
+    #registra un nuovo goal nella memoria del monitor
+    def create_store_action_goal_lines(self, data_dict_name, service_expr):
+        lines = [
+            "if {service}.endswith('/_action/send_goal') and 'response' in {data} and isinstance({data}['response'], dict):\n".format(service=service_expr, data=data_dict_name), # se messaggio intercettato = send goal. se si ha già ricevuto risposta da server.
+            "    if {data}['response'].get('accepted') and 'goal_id_key' in {data}:\n".format(data=data_dict_name), # se response del server = accepted ed abbiamo un goal_id_key
+            "        {goals}[{data}['goal_id_key']] = {{'action_name': {data}.get('action_name'), 'time': {data}['time'], 'cancelled': False, 'cancel_requested_by_monitor': False, 'cancel_requested_by_client': False, 'done': False}}\n".format(goals=self.action_goals_info, data=data_dict_name), # goal accettato, salviamo un dizionario con informazioni riguardanti stato e key goal_id
+        ]
+        return lines
+    #cancella un goal già accettato dal server, quando il monitor decide che la response send_goal non è valida.
+    def create_cancel_action_goal_lines(self, data_dict_name, service_expr):
+        lines = [
+            "if {service}.endswith('/_action/send_goal') and 'response' in {data} and isinstance({data}['response'], dict):\n".format(service=service_expr, data=data_dict_name), #service = send_goal
+            "    if {data}['response'].get('accepted') and 'goal_id_key' in {data}:\n".format(data=data_dict_name), # se risposta accettata da server
+            "        cancel_service = {data}.get('action_name', {service}.replace('/_action/send_goal', '')) + '/_action/cancel_goal'\n".format(data=data_dict_name, service=service_expr), #costruisce il cancel goal da inviare al server
+            "        if cancel_service in {srvdict}:\n".format(srvdict=self.config_client_srvs_dict_name), # controlla se il monitor ha un client che può inviare messaggio di cancellazione
+            "            cancel_request = CancelGoal.Request()\n", #crea req cancel
+            "            rosidl_runtime_py.set_message_fields(cancel_request, {{'goal_info': {{'goal_id': {data}['goal_id']}}}})\n".format(data=data_dict_name), #inserisce id nella request
+            "            {srvdict}[cancel_service].call_service(cancel_request)\n".format(srvdict=self.config_client_srvs_dict_name), #invia il messaggio di cancellazione
+            "        if {data}['goal_id_key'] in {goals}:\n".format(data=data_dict_name, goals=self.action_goals_info), # controllo di rinforzo ma eliminabile per verificare che il goal sia in memoria
+            "            {goals}[{data}['goal_id_key']]['cancel_requested_by_monitor'] = True\n".format(data=data_dict_name, goals=self.action_goals_info), #modifica stato in memoria monitor del goal
+            "            {goals}[{data}['goal_id_key']]['cancelled'] = True\n".format(data=data_dict_name, goals=self.action_goals_info), #modifica stato in memoria monitor del goal
+        ]
+        return lines
+
+    # quando risposta get_result viola proprietà monitor esso restituisce al client una response con stato ABORTED.    
+    def create_filter_get_result_lines(self, data_dict_name, service_expr):
+        lines = [
+            "if {service}.endswith('/_action/get_result'):\n".format(service=service_expr), # controlla che sia una get_result
+            "    response_cls = eval({srv_info}[service]['type'] + '.Response')\n".format(srv_info=self.services_info), #cpstruisce una nuova risposta filtrata da inviare
+            "    filtered_response = response_cls()\n",
+            "    filtered_response.status = GoalStatus.STATUS_ABORTED\n", #imposta stato in aborted
+            "    return filtered_response\n", 
+        ]
+        return lines
+
+    # quando risposta get_result viola proprietà monitor esso restituisce al client una response con stato ERROR_REJECTED.
+    def create_filter_cancel_goal_lines(self, data_dict_name, service_expr):
+        lines = [
+            "if {service}.endswith('/_action/cancel_goal'):\n".format(service=service_expr),
+            "    response_cls = eval({srv_info}[service]['type'] + '.Response')\n".format(srv_info=self.services_info),
+            "    filtered_response = response_cls()\n",
+            "    filtered_response.return_code = CancelGoal.Response.ERROR_REJECTED\n",
+            "    return filtered_response\n",
+        ]
+        return lines
+    #rimuove dalla memoria del monitor goal non più da monitorare
+    #quando arriva un get_result il valore 
+    def create_finalize_action_goal_lines(self, data_dict_name, service_expr):
+        lines = [
+            "if {service}.endswith('/_action/get_result') and 'goal_id_key' in {data} and {data}['goal_id_key'] in {goals}:\n".format(service=service_expr, data=data_dict_name, goals=self.action_goals_info), #se il service termina con get_result, nel diz è preente goal_id_key e il goal è effettivamente salvato nella lista del monitor
+            "    {goals}[{data}['goal_id_key']]['done'] = True\n".format(data=data_dict_name, goals=self.action_goals_info), # lo segna come terminato (ridondate, aggiunto per chiarezza)
+            "    del {goals}[{data}['goal_id_key']]\n".format(data=data_dict_name, goals=self.action_goals_info), #lo elimina
+            "if {service}.endswith('/_action/cancel_goal') and 'goal_id_key' in {data} and {data}['goal_id_key'] in {goals}:\n".format(service=service_expr, data=data_dict_name, goals=self.action_goals_info), #nel caso di cancel uguale
+            "    {goals}[{data}['goal_id_key']]['cancelled'] = True\n".format(data=data_dict_name, goals=self.action_goals_info),
+            "    {goals}[{data}['goal_id_key']]['done'] = True\n".format(data=data_dict_name, goals=self.action_goals_info),
+            "    del {goals}[{data}['goal_id_key']]\n".format(data=data_dict_name, goals=self.action_goals_info),
+        ]
+        return lines
+
+    #registrare che la richiesta di cancellazione è partita dal client
+    def create_track_cancel_request_lines(self, data_dict_name, service_expr):
+        lines = [
+            "if {service}.endswith('/_action/cancel_goal') and 'goal_id_key' in {data} and {data}['goal_id_key'] in {goals}:\n".format(service=service_expr, data=data_dict_name, goals=self.action_goals_info), #solo il client invia la cancel su quel canale. quindi sappiamo che arriva da lui senza ulteriori azioni
+            "    {goals}[{data}['goal_id_key']]['cancel_requested_by_client'] = True\n".format(data=data_dict_name, goals=self.action_goals_info), #modifica stato
+        ]
+        return lines
+
+    #prova l'inivio di una cancel al server
+    def create_retry_cancel_goal_lines(self, data_dict_name, service_expr):
+        lines = [
+            "if {service}.endswith('/_action/cancel_goal') and 'goal_id' in {data}:\n".format(service=service_expr, data=data_dict_name), #controllo che finisca in canel goal la richiesta e il goal_id sia presente in memoria
+            "    cancel_service = {data}.get('action_name', {service}.replace('/_action/cancel_goal', '')) + '/_action/cancel_goal'\n".format(data=data_dict_name, service=service_expr), #costruisce la cancel
+            "    if cancel_service in {srvdict}:\n".format(srvdict=self.config_client_srvs_dict_name), # verifica che il monitor abbia un client per inviare il messaggio
+            "        cancel_request = CancelGoal.Request()\n", #crea richiesta
+            "        rosidl_runtime_py.set_message_fields(cancel_request, {{'goal_info': {{'goal_id': {data}['goal_id']}}}})\n".format(data=data_dict_name), #inserisce goal_id
+            "        {srvdict}[cancel_service].call_service(cancel_request)\n".format(srvdict=self.config_client_srvs_dict_name), #la invia
+        ]
+        return lines
+
+    # caso violazione topic ptova eliminazione goal coinvolti
+    def create_cancel_action_topic_goal_lines(self, data_dict_name):
+        lines = [
+            "goal_ids = []\n", #lista vuota
+            "if 'goal_id' in {data}:\n".format(data=data_dict_name), #caso feedback (1 id)
+            "    goal_ids.append({data}['goal_id'])\n".format(data=data_dict_name),
+            "if 'goal_ids' in {data} and isinstance({data}['goal_ids'], list):\n".format(data=data_dict_name), #caso status (+ id)
+            "    goal_ids.extend([goal_id for goal_id in {data}['goal_ids'] if goal_id not in goal_ids])\n".format(data=data_dict_name), #evita duplicati nella lista
+            "for goal_id in goal_ids:\n", #per ogni goal
+            "    goal_id_key = json.dumps(goal_id, sort_keys=True)\n", #crea key per cercare nella lista 
+            "    goal_state = {goals}.get(goal_id_key, {{'action_name': {data}.get('action_name'), 'time': {data}.get('time'), 'cancelled': False, 'cancel_requested_by_monitor': False, 'cancel_requested_by_client': False, 'done': False}})\n".format(goals=self.action_goals_info, data=data_dict_name), #recupera goal status, se presente oppure crea stato predefinito
+            "    if not goal_state.get('cancelled', False):\n", #se il goal non risulta già cancellato procede
+            "        cancel_service = goal_state.get('action_name', {data}.get('action_name')) + '/_action/cancel_goal'\n".format(data=data_dict_name), #crea service
+            "        self.get_logger().info('Attempting topic-side cancel via ' + str(cancel_service) + ' for goal ' + str(goal_id_key))\n", #logging
+            "        if cancel_service in {srvdict}:\n".format(srvdict=self.config_client_srvs_dict_name), # se client per invio esiste:
+            "            cancel_request = CancelGoal.Request()\n", 
+            "            rosidl_runtime_py.set_message_fields(cancel_request, {'goal_info': {'goal_id': goal_id}})\n",#inserisce goal da cancellare
+            "            {srvdict}[cancel_service].call_service(cancel_request)\n".format(srvdict=self.config_client_srvs_dict_name), #invia richiesta
+            "            goal_state['cancelled'] = True\n",
+            "            goal_state['cancel_requested_by_monitor'] = True\n",
+            "            goal_state['action_name'] = goal_state.get('action_name', {data}.get('action_name'))\n".format(data=data_dict_name),
+            "            {goals}[goal_id_key] = goal_state\n".format(goals=self.action_goals_info), #salva lo stato
+            "        else:\n", #non esiste il client
+
+
+
+
+
+
+            
+            "            self.get_logger().info('Unable to resolve cancel service ' + str(cancel_service) + ' from monitor configuration')\n",
+        ]
         return lines
             
     # class init function 
@@ -831,6 +1075,7 @@ class MonitorGenerator():
             "{dname}={{}}\n".format(dname=self.config_server_srvs_dict_name),
             "{dname}={{}}\n".format(dname=self.services_info),
             "{dname}={{}}\n".format(dname=self.messages_dict_name),
+            "{dname}={{}}\n".format(dname=self.action_goals_info), #lista goal monitorati
             "{varname}=Lock()\n".format(varname=self.threading_loc_name),
             "{0}={1}\n".format(self.monitor_id_vname,self.mon_name_input),
             "{0}={1}\n".format(self.actions_vname,self.actions_name_input),
@@ -893,7 +1138,7 @@ class MonitorGenerator():
         
         if oracle_url != None and oracle_port != None:
             wslines = [
-                "websocket.enableTrace(True)\n",
+                "websocket.enableTrace(False)\n",
                 "{ws} = websocket.WebSocket()\n".format(ws=self.websocket_name),
                 "{ws}.connect('ws://{u}:{p}')\n".format(ws=self.websocket_name,u=oracle_url,p=oracle_port)
                 ]
@@ -909,7 +1154,9 @@ class MonitorGenerator():
     def create_topics_info_dict(self,tp_lists):
         lines=[]
         for t in tp_lists:
-            line = "{t_info_var}['{tname}']={tdict}\n".format(t_info_var=self.topics_info,tname=t,tdict=tp_lists[t])
+            tdict = tp_lists[t].copy()
+            tdict['type'] = self.get_runtime_type_expr(tp_lists[t]) # type non fa più riferimento a una stringa, ma alla classe del messaggio. con la stringa non possiamo passarlo a ROS2 e usare le funzioni
+            line = "{t_info_var}['{tname}']={tdict}\n".format(t_info_var=self.topics_info,tname=t,tdict=tdict)
             lines.append(line)
             
         return lines
@@ -917,7 +1164,9 @@ class MonitorGenerator():
     def create_services_info_dict(self,srv_lists):
         lines=[]
         for s in srv_lists:
-            line = "{s_info_var}['{sname}']={sdict}\n".format(s_info_var=self.services_info,sname=s,sdict=srv_lists[s])
+            sdict = srv_lists[s].copy()
+            sdict['type'] = self.get_runtime_type_expr(srv_lists[s]) # uguale ma per services
+            line = "{s_info_var}['{sname}']={sdict}\n".format(s_info_var=self.services_info,sname=s,sdict=sdict)
             lines.append(line)
             
         return lines
@@ -1013,6 +1262,10 @@ class MonitorGenerator():
         lines.append(lineprefix + line)
         line = "self.cli = self.create_client(service_type, service_name)\n"
         lines.append(lineprefix + line)
+        line = "self.service_executor = SingleThreadedExecutor()\n"
+        lines.append(lineprefix + line)
+        line = "self.service_executor.add_node(self)\n"
+        lines.append(lineprefix + line)
         line = "while not self.cli.wait_for_service(timeout_sec=1.0):\n"
         lines.append(lineprefix + line)
         lineprefix = self.codegenutils.inc_indent(lineprefix)
@@ -1025,7 +1278,7 @@ class MonitorGenerator():
         lineprefix = self.codegenutils.inc_indent(lineprefix)
         line = "self.future = self.cli.call_async(request)\n"
         lines.append(lineprefix + line)
-        line = "rclpy.spin_until_future_complete(self, self.future)\n"
+        line = "self.service_executor.spin_until_future_complete(self.future)\n"
         lines.append(lineprefix + line)
         line = "return self.future.result()\n"
         lines.append(lineprefix + line)
@@ -1117,7 +1370,9 @@ class MonitorGenerator():
                      'threading':'*',
                      'rosmonitoring_interfaces.msg':'MonitorError',
                      'std_msgs.msg':'*',
-                     'rclpy.callback_groups':'MutuallyExclusiveCallbackGroup'}
+                     'rclpy.executors':'SingleThreadedExecutor',
+                     'rclpy.callback_groups':'MutuallyExclusiveCallbackGroup',
+                     'rclpy.qos':'qos_profile_action_status_default'}
         
         ''' generate import lines for all the other message types '''
         for tp in tp_lists:
@@ -1170,7 +1425,7 @@ class MonitorGenerator():
         header = "def {fname}(self,{f_input}):\n".format(fname=func_name, f_input=func_input_varname)
         lines = [header]
         
-        data_dict_name = "dict"
+        data_dict_name = "event_dict"
 
         # log output if not silent
         if not silent:
@@ -1184,6 +1439,8 @@ class MonitorGenerator():
         
         line = "{data_dict_name}['topic']='{tname}'\n".format(data_dict_name=data_dict_name, tname=tname)
         lines.append(lineprefix + line)
+        manylines = self.create_action_topic_metadata_lines(data_dict_name, "{0}['topic']".format(data_dict_name)) # aggiunge dati action quando arriva un evento topic
+        lines = self.codegenutils.append_lines_to_list_with_prefix(lines, manylines, lineprefix)
         
         line = "{data_dict_name}['time']={ros_time}\n".format(data_dict_name=data_dict_name, ros_time=self.codegenutils.get_ros_time_line())
         lines.append(lineprefix + line)
@@ -1246,7 +1503,7 @@ class MonitorGenerator():
         header = "def {fname}(self, {f_req}, {f_res}):\n".format(fname=func_name, f_req=func_request, f_res=func_response)
         lines = [header]
         
-        data_dict_name = "dict"
+        data_dict_name = "event_dict"
 
         # log output if not silent
         if not silent:
@@ -1255,13 +1512,15 @@ class MonitorGenerator():
             line = self.codegenutils.get_ros_info_logging_line(message)
             lines.append(lineprefix + line)
         # convert the data to send to the oracle or log
-        line = "dict = {}\n"
+        line = "{0} = {{}}\n".format(data_dict_name)
         lines.append(lineprefix + line)
         line = "{0}['request']= rosidl_runtime_py.message_to_ordereddict({1})\n".format(data_dict_name, func_request)
         lines.append(lineprefix + line)
         
         line = "{data_dict_name}['service']='{srvname}'\n".format(data_dict_name=data_dict_name, srvname=srvname.replace('_mon', ''))
         lines.append(lineprefix + line)
+        manylines = self.create_action_metadata_lines(data_dict_name, "{0}['service']".format(data_dict_name), 'request')
+        lines = self.codegenutils.append_lines_to_list_with_prefix(lines, manylines, lineprefix)
         
         line = "{data_dict_name}['time']={ros_time}\n".format(data_dict_name=data_dict_name, ros_time=self.codegenutils.get_ros_time_line())
         lines.append(lineprefix + line)
@@ -1314,20 +1573,8 @@ class MonitorGenerator():
             line = self.codegenutils.get_ros_info_logging_line('"{0}"'.format(log_msg))
             lines.append(lineprefix + line)
             
-        line = "try:\n"
-        lines.append(lineprefix + line)
-        lineprefix = self.codegenutils.inc_indent(lineprefix)
         line = "return {msg_fname}({msg_vname})\n".format(msg_fname=self.message_received_fname_service_request, msg_vname=oracle_response_varname)
         lines.append(lineprefix + line)
-        lineprefix = self.codegenutils.dec_indent(lineprefix)
-        line = "except:\n"
-        lines.append(lineprefix + line)
-        lineprefix = self.codegenutils.inc_indent(lineprefix)
-        line = "{f_res}.error = True\n".format(f_res=func_response)
-        lines.append(lineprefix + line)
-        line = "return {f_res}\n".format(f_res=func_response)
-        lines.append(lineprefix + line)
-        lineprefix = self.codegenutils.dec_indent(lineprefix)
         
         self.codegenutils.check_indent("create callback func done")   
         return {'name':func_name, 'lines':lines}

@@ -34,6 +34,60 @@ from generator import *
 # test using python generator_test.py --config online_config.yaml
 # or offline_config.yaml
 
+def _normalize_action_name(name):
+	if name.endswith('/'):
+		return name[:-1]
+	return name
+
+def _expand_actions_to_topics_and_services(actions): #divide una action nelle 2 topic : feedback, status e 3 services : send_goal, get_result, cancela-goal
+
+	topics = []
+	services = []
+	for action_cfg in actions: #per ogni action presente
+		action_name = _normalize_action_name(action_cfg['name']) #funz che toglie i / alla fine del nome 
+		action_type = action_cfg['type'] #tipo completo pack + action : <package>.action.<NomeAction>
+		action_mode = action_cfg['action'] #campo log | filter 
+
+		# DIvisione in topic e services necessari
+		feedback_topic = {
+			'name': action_name + '/_action/feedback',
+			'type': action_type + '_FeedbackMessage',
+			'action': action_mode
+		}
+		status_topic = {
+			'name': action_name + '/_action/status',
+			'type': 'action_msgs.msg.GoalStatusArray', #specificato da ros2
+			'action': action_mode
+		}
+		send_goal_service = {
+			'name': action_name + '/_action/send_goal',
+			'type': action_type + '_SendGoal',
+			'action': action_mode
+		}
+		get_result_service = {
+			'name': action_name + '/_action/get_result',
+			'type': action_type + '_GetResult',
+			'action': action_mode
+		}
+		cancel_goal_service = {
+			'name': action_name + '/_action/cancel_goal',
+			'type': 'action_msgs.srv.CancelGoal', #speciicato da ros2
+			'action': action_mode
+		}
+		# in base alle specifiche dello yaml modifico sub e pub nei canali creati per la action
+		if 'clients' in action_cfg:
+			send_goal_service['publishers'] = list(action_cfg['clients'])
+			get_result_service['publishers'] = list(action_cfg['clients'])
+			cancel_goal_service['publishers'] = list(action_cfg['clients'])
+		if 'servers' in action_cfg:
+			feedback_topic['publishers'] = list(action_cfg['servers'])
+			status_topic['publishers'] = list(action_cfg['servers'])
+
+		topics.extend([feedback_topic, status_topic])
+		services.extend([send_goal_service, get_result_service, cancel_goal_service])
+
+	return topics, services
+
 def copy_dir(source, destination):
     destination_path: pathlib.Path
 
@@ -65,7 +119,7 @@ def copytree(src, dst, symlinks=False, ignore=None):
         s = os.path.join(src, item)
         d = os.path.join(dst, item)
         if os.path.isdir(s):
-            shutil.copytree(s, d, symlinks, ignore)
+            shutil.copytree(s, d, symlinks=symlinks, ignore=ignore, dirs_exist_ok=True)
         else:
             shutil.copy2(s, d)
 
@@ -88,7 +142,7 @@ def main(argv):
 			monpathfound = False
 			
 			if 'path' in config:
-				monpath = config['path']
+				monpath = config['path'] #prende il path ros del file config.yaml
 				if not monpath.endswith('src/'):
 					if not monpath.endswith('src'):
 						print('Monitor path needs to end with src/ - current value: {0}'.format(monpath))
@@ -102,7 +156,7 @@ def main(argv):
 							
 								
 						
-					
+					#controllo che tutti i campi di ogni nodo specificato in config.yaml siano popolati
 			if 'nodes' in config:  # check if there are nodes to be instrumented
 				for node in config['nodes']:
 					if 'name' not in node['node'] or 'package' not in node['node'] or 'path' not in node['node']:
@@ -117,9 +171,9 @@ def main(argv):
 				ids = []
 				for monitor in config['monitors']:
 
-					if 'id' not in monitor['monitor'] or ('topics' not in monitor['monitor'] and 'services' not in monitor['monitor']) or 'log' not in monitor['monitor']:
-						print('Each monitor in the configuration file must contain the id, log and list of the topics (or services) fields.')
-						return
+					if 'id' not in monitor['monitor'] or ('topics' not in monitor['monitor'] and 'services' not in monitor['monitor'] and 'actions' not in monitor['monitor']) or 'log' not in monitor['monitor']:
+						print('Each monitor in the configuration file must contain id, log and at least one among topics/services/actions.')
+						return #controllo che tutti i campi di monitor siano popolati
 					if 'oracle' in monitor['monitor']  and ('port' not in monitor['monitor']['oracle'] or 'url' not in monitor['monitor']['oracle'] or 'action' not in monitor['monitor']['oracle']):
 						print('Url, port and action must be specified inside the oracle.')
 						return
@@ -127,18 +181,29 @@ def main(argv):
 						monitor['monitor']['topics'] = []
 					if 'services' not in monitor['monitor']:
 						monitor['monitor']['services'] = []
+					if 'actions' not in monitor['monitor']:
+						monitor['monitor']['actions'] = []
+					#action_with_type_and_mode è un singolo elemento della lista actions dello yaml 
+					for action_with_type_and_mode in monitor['monitor']['actions']:
+						#controllo che i campi non siano vuoti
+						if 'name' not in action_with_type_and_mode or 'type' not in action_with_type_and_mode or 'action' not in action_with_type_and_mode:
+							print('Each action needs a name, a type and an action.')
+							return
+						if action_with_type_and_mode['action'] not in ['log', 'filter']:
+							print('The actions available for actions are: log, filter.')
+							return
+						if (('clients' not in action_with_type_and_mode and 'servers' not in action_with_type_and_mode) or 'oracle' not in monitor['monitor']) and action_with_type_and_mode['action'] == 'filter':
+							print('In order to filter wrong action goals, the monitor has to be ONLINE and needs clients (or servers).')
+							return
+					action_topics, action_services = _expand_actions_to_topics_and_services(monitor['monitor']['actions'])
+					monitor['monitor']['topics'].extend(action_topics)
+					monitor['monitor']['services'].extend(action_services)
 					for topic_with_types_and_action in monitor['monitor']['topics']:
 						if 'name' not in topic_with_types_and_action or 'type' not in topic_with_types_and_action or 'action' not in topic_with_types_and_action:
 							print('Each topic needs a name, a type and an action.')
 							return
 						if topic_with_types_and_action['action'] not in ['log', 'filter']:
 							print('The actions available for the topics are: log, filter.')
-							return
-						if (('publishers' not in topic_with_types_and_action and 'subscribers' not in topic_with_types_and_action) or 'oracle' not in monitor['monitor']) and topic_with_types_and_action['action'] == 'filter':
-							print('In order to filter the wrong messages, the monitor has to be ONLINE and in the middle of the communication. To have this, the \'oracle\' field and the list of publishers (or subscribers) must be given.')
-							return
-						if 'publishers' in topic_with_types_and_action and 'subscribers' in topic_with_types_and_action:
-							print('The publishers and subscribers fileds are mutually exclusive. The instrumentation process affects only one side per time.')
 							return
 						if 'publishers' in topic_with_types_and_action:
 							for publisher in topic_with_types_and_action['publishers']:
@@ -159,6 +224,23 @@ def main(argv):
 						if service_with_types_and_action['action'] not in ['log', 'filter']:
 							print('The actions available for the services are: log, filter.')
 							return
+						if 'publishers' in service_with_types_and_action and 'subscribers' in service_with_types_and_action and '/_action/' not in service_with_types_and_action['name']:
+							print('The publishers and subscribers fields are mutually exclusive for services.')
+							return
+						if service_with_types_and_action['action'] == 'filter' and ('publishers' not in service_with_types_and_action and 'subscribers' not in service_with_types_and_action):
+							print('Warning: filtering service ' + service_with_types_and_action['name'] + ' without publishers/subscribers remap hints may not intercept traffic.') # se con filter mancano sia pub che sub
+						if 'publishers' in service_with_types_and_action:
+							for publisher in service_with_types_and_action['publishers']:
+								if publisher not in nodes:
+									print('The service client node ' + publisher + ' has not been defined in the list of nodes.')
+									return #return se il nodo specificato in pub non è nella lista dei nodi
+								nodes[publisher][2].append(service_with_types_and_action['name'])
+						if 'subscribers' in service_with_types_and_action:
+							for subscriber in service_with_types_and_action['subscribers']:
+								if subscriber not in nodes:
+									print('The service server node ' + subscriber + ' has not been defined in the list of nodes.')
+									return #return se il nodo specificato in sub non è nella lista dei nodi
+								nodes[subscriber][2].append(service_with_types_and_action['name'])
 					if 'oracle' in monitor['monitor']:
 						url = monitor['monitor']['oracle']['url']
 						port = monitor['monitor']['oracle']['port']
