@@ -1,0 +1,15 @@
+.venv/
+build/
+install/
+log/
+results/
+src/monitor/
+src/rosmonitoring_interfaces/
+clearpath/robot.urdf.xacro
+clearpath/robot.srdf
+clearpath/robot.srdf.xacro
+clearpath/manipulators/
+clearpath/platform/
+clearpath/sensors/
+__pycache__/
+*.pyc

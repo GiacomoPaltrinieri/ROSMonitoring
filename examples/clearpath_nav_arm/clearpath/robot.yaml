@@ -1,0 +1,56 @@
+serial_number: a200-0000
+version: 0
+system:
+  hosts:
+    - hostname: cpr-a200-0000
+      ip: 127.0.0.1
+  ros2:
+    namespace: a200_0000
+platform:
+  enable_ekf: true
+  attachments:
+    - name: front_bumper
+      type: a200.bumper
+      parent: front_bumper_mount
+    - name: rear_bumper
+      type: a200.bumper
+      parent: rear_bumper_mount
+    - name: top_plate
+      type: a200.top_plate
+      model: default
+manipulators:
+  arms:
+    - model: kinova_gen3_lite
+      parent: top_plate_default_mount
+      xyz: [0.0, 0.0, 0.0]
+      rpy: [0.0, 0.0, 0.0]
+      ip: 192.168.131.40
+      port: 10000
+      gripper:
+        model: kinova_2f_lite
+sensors:
+  imu:
+    - model: phidgets_spatial
+      urdf_enabled: true
+      launch_enabled: true
+      parent: base_link
+      xyz: [0.059, 0.0, 0.161275]
+      rpy: [0.0, 0.0, 0.0]
+      ros_parameters:
+        phidgets_spatial:
+          data_interval_ms: 20
+  lidar2d:
+    - model: hokuyo_ust
+      urdf_enabled: true
+      launch_enabled: true
+      parent: top_plate_front_mount
+      xyz: [0.0, 0.0, 0.15]
+      rpy: [0.0, 0.0, 0.0]
+      ros_parameters:
+        urg_node:
+          laser_frame_id: lidar2d_0_laser
+          # The UST is a 270-degree lidar.  Keeping a full 360-degree scan here
+          # makes the simulated sensor see the arm mounted behind it; Nav2's
+          # collision monitor then (correctly) suppresses every velocity command.
+          angle_min: -2.356194490192345
+          angle_max: 2.356194490192345

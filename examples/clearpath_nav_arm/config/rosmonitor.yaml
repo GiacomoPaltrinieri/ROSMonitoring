@@ -1,0 +1,29 @@
+path: src/
+
+monitors:
+  - monitor:
+      id: nav_arm_interlock_monitor
+      log: /dev/null
+      silent: true
+      warning: 1
+      oracle:
+        url: 127.0.0.1
+        port: 8080
+        action: nothing
+      topics:
+        - name: /a200_0000/monitor_joint_states
+          type: sensor_msgs.msg.JointState
+          action: log
+        - name: /a200_0000/navigate_to_pose/_action/status
+          type: action_msgs.msg.GoalStatusArray
+          action: log
+      services:
+        - name: /a200_0000/navigate_to_pose/_action/send_goal
+          type: nav2_msgs.action.NavigateToPose_SendGoal
+          action: filter
+        - name: /a200_0000/arm_0_joint_trajectory_controller/follow_joint_trajectory/_action/send_goal
+          type: control_msgs.action.FollowJointTrajectory_SendGoal
+          action: filter
+        - name: /a200_0000/arm_0_gripper_controller/gripper_cmd/_action/send_goal
+          type: control_msgs.action.GripperCommand_SendGoal
+          action: filter
