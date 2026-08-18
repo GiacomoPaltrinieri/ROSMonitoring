@@ -106,6 +106,18 @@ venv.bak/
 # generated files
 *.pyc
 
+# ROS 2 action benchmark generated workspace files
+benchmarks/action_benchmark/ros2_ws/build/
+benchmarks/action_benchmark/ros2_ws/install/
+benchmarks/action_benchmark/ros2_ws/log/
+benchmarks/action_benchmark/ros2_ws/src/monitor/
+benchmarks/action_benchmark/ros2_ws/src/rosmonitoring_interfaces/
+benchmarks/action_benchmark/ros2_ws/src/action_benchmark/config/rosmonitoring_n*.yaml
+benchmarks/action_benchmark/ros2_ws/src/action_benchmark/launch/run_instrumented.launch
+benchmarks/action_benchmark/results/*
+!benchmarks/action_benchmark/results/benchmark_results_independent_rep5_clean.csv
+generator/ros2_devel/code/monitor/monitor/action_benchmark_monitor.py
+
 # evaluation folder
 evaluation/
 evaluation/*.py

@@ -1,0 +1,18 @@
+<launch>
+  <arg name="n" default="5"/>
+  <arg name="goals" default="100"/>
+  <arg name="order" default="20"/>
+  <arg name="repetitions" default="1"/>
+
+  <node pkg="action_benchmark" exec="bench_server" name="bench_server">
+    <param name="n" value="$(var n)"/>
+  </node>
+
+  <node pkg="action_benchmark" exec="bench_client" name="bench_client"
+        output="screen" on_exit="shutdown">
+    <param name="n" value="$(var n)"/>
+    <param name="goals" value="$(var goals)"/>
+    <param name="order" value="$(var order)"/>
+    <param name="repetitions" value="$(var repetitions)"/>
+  </node>
+</launch>
