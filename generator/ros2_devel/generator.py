@@ -771,6 +771,8 @@ class MonitorGenerator():
         line = "return filtered_response\n" #return se topic .../_action/send_goal e proprietà violata.
         lines.append(lineprefix + line)
         lineprefix = self.codegenutils.dec_indent(lineprefix)
+        manylines = self.create_filter_get_result_request_lines(jsondict, "service")
+        lines = self.codegenutils.append_lines_to_list_with_prefix(lines, manylines, lineprefix)
         manylines = self.create_filter_cancel_goal_lines(jsondict, "service") #aggiunge logica risposta ROS2 a cancel
         lines = self.codegenutils.append_lines_to_list_with_prefix(lines, manylines, lineprefix)
         line = "raise Exception('The request violates the monitor specification, so it has been filtered out.')\n\n"
@@ -898,7 +900,7 @@ class MonitorGenerator():
         line = "return filtered_response\n"
         lines.append(lineprefix + line)
         lineprefix = self.codegenutils.dec_indent(lineprefix)
-        manylines = self.create_filter_get_result_lines(jsondict, "service")
+        manylines = self.create_filter_get_result_response_lines(jsondict, "service")
         lines = self.codegenutils.append_lines_to_list_with_prefix(lines, manylines, lineprefix)
         manylines = self.create_retry_cancel_goal_lines(jsondict, "service")
         lines = self.codegenutils.append_lines_to_list_with_prefix(lines, manylines, lineprefix)
@@ -931,9 +933,16 @@ class MonitorGenerator():
             "    {data}['event_kind'] = 'cancel_action_{payload}'\n".format(data=data_dict_name, payload=payload_key),
             "    {data}['action_name'] = {service}.replace('/_action/cancel_goal', '')\n".format(data=data_dict_name, service=service_expr),
             "    if '{payload}' in {data} and isinstance({data}['{payload}'], dict) and 'goal_info' in {data}['{payload}'] and 'goal_id' in {data}['{payload}']['goal_info']:\n".format(data=data_dict_name, payload=payload_key),
+            "        {data}['cancel_goal_info'] = {data}['{payload}']['goal_info']\n".format(data=data_dict_name, payload=payload_key),
             "        {data}['goal_id'] = {data}['{payload}']['goal_info']['goal_id']\n".format(data=data_dict_name, payload=payload_key),
             "        {data}['goal_id_key'] = json.dumps({data}['goal_id'], sort_keys=True)\n".format(data=data_dict_name),
         ]
+        if payload_key == 'response':
+            lines.extend([
+                "    if isinstance({data}.get('response'), dict) and isinstance({data}['response'].get('goals_canceling'), list):\n".format(data=data_dict_name),
+                "        {data}['goal_ids'] = [goal_info['goal_id'] for goal_info in {data}['response']['goals_canceling'] if isinstance(goal_info, dict) and 'goal_id' in goal_info]\n".format(data=data_dict_name),
+                "        {data}['goal_id_keys'] = [json.dumps(goal_id, sort_keys=True) for goal_id in {data}['goal_ids']]\n".format(data=data_dict_name),
+            ])
         return lines
     #aggiunge dati in topics che fanno parte di actions.
     def create_action_topic_metadata_lines(self, data_dict_name, topic_expr):
@@ -976,18 +985,32 @@ class MonitorGenerator():
         ]
         return lines
 
-    # quando risposta get_result viola proprietà monitor esso restituisce al client una response con stato ABORTED.    
-    def create_filter_get_result_lines(self, data_dict_name, service_expr):
+    # Una richiesta get_result non valida non raggiunge il server. Il monitor
+    # restituisce una risposta valida senza modificare o cancellare il goal.
+    def create_filter_get_result_request_lines(self, data_dict_name, service_expr):
+        lines = [
+            "if {service}.endswith('/_action/get_result'):\n".format(service=service_expr),
+            "    response_cls = eval({srv_info}[service]['type'] + '.Response')\n".format(srv_info=self.services_info),
+            "    filtered_response = response_cls()\n",
+            "    filtered_response.status = GoalStatus.STATUS_UNKNOWN\n",
+            "    return filtered_response\n",
+        ]
+        return lines
+
+    # Quando una risposta get_result viola la proprietà, il monitor restituisce
+    # al client una risposta valida con stato ABORTED.
+    def create_filter_get_result_response_lines(self, data_dict_name, service_expr):
         lines = [
             "if {service}.endswith('/_action/get_result'):\n".format(service=service_expr), # controlla che sia una get_result
-            "    response_cls = eval({srv_info}[service]['type'] + '.Response')\n".format(srv_info=self.services_info), #cpstruisce una nuova risposta filtrata da inviare
+            "    response_cls = eval({srv_info}[service]['type'] + '.Response')\n".format(srv_info=self.services_info), # costruisce una nuova risposta filtrata da inviare
             "    filtered_response = response_cls()\n",
             "    filtered_response.status = GoalStatus.STATUS_ABORTED\n", #imposta stato in aborted
             "    return filtered_response\n", 
         ]
         return lines
 
-    # quando risposta get_result viola proprietà monitor esso restituisce al client una response con stato ERROR_REJECTED.
+    # Quando una richiesta o risposta cancel_goal viola la proprietà, il monitor
+    # restituisce al client una risposta valida con stato ERROR_REJECTED.
     def create_filter_cancel_goal_lines(self, data_dict_name, service_expr):
         lines = [
             "if {service}.endswith('/_action/cancel_goal'):\n".format(service=service_expr),
@@ -997,17 +1020,21 @@ class MonitorGenerator():
             "    return filtered_response\n",
         ]
         return lines
-    #rimuove dalla memoria del monitor goal non più da monitorare
-    #quando arriva un get_result il valore 
+    # Rimuove dalla memoria i goal completati o accettati per la cancellazione.
     def create_finalize_action_goal_lines(self, data_dict_name, service_expr):
         lines = [
             "if {service}.endswith('/_action/get_result') and 'goal_id_key' in {data} and {data}['goal_id_key'] in {goals}:\n".format(service=service_expr, data=data_dict_name, goals=self.action_goals_info), #se il service termina con get_result, nel diz è preente goal_id_key e il goal è effettivamente salvato nella lista del monitor
             "    {goals}[{data}['goal_id_key']]['done'] = True\n".format(data=data_dict_name, goals=self.action_goals_info), # lo segna come terminato (ridondate, aggiunto per chiarezza)
             "    del {goals}[{data}['goal_id_key']]\n".format(data=data_dict_name, goals=self.action_goals_info), #lo elimina
-            "if {service}.endswith('/_action/cancel_goal') and 'goal_id_key' in {data} and {data}['goal_id_key'] in {goals}:\n".format(service=service_expr, data=data_dict_name, goals=self.action_goals_info), #nel caso di cancel uguale
-            "    {goals}[{data}['goal_id_key']]['cancelled'] = True\n".format(data=data_dict_name, goals=self.action_goals_info),
-            "    {goals}[{data}['goal_id_key']]['done'] = True\n".format(data=data_dict_name, goals=self.action_goals_info),
-            "    del {goals}[{data}['goal_id_key']]\n".format(data=data_dict_name, goals=self.action_goals_info),
+            "if {service}.endswith('/_action/cancel_goal') and isinstance({data}.get('response'), dict):\n".format(service=service_expr, data=data_dict_name),
+            "    if {data}['response'].get('return_code') == CancelGoal.Response.ERROR_NONE:\n".format(data=data_dict_name),
+            "        for goal_info in {data}['response'].get('goals_canceling', []):\n".format(data=data_dict_name),
+            "            if isinstance(goal_info, dict) and 'goal_id' in goal_info:\n",
+            "                goal_id_key = json.dumps(goal_info['goal_id'], sort_keys=True)\n",
+            "                if goal_id_key in {goals}:\n".format(goals=self.action_goals_info),
+            "                    {goals}[goal_id_key]['cancelled'] = True\n".format(goals=self.action_goals_info),
+            "                    {goals}[goal_id_key]['done'] = True\n".format(goals=self.action_goals_info),
+            "                    del {goals}[goal_id_key]\n".format(goals=self.action_goals_info),
         ]
         return lines
 
@@ -1022,12 +1049,18 @@ class MonitorGenerator():
     #prova l'inivio di una cancel al server
     def create_retry_cancel_goal_lines(self, data_dict_name, service_expr):
         lines = [
-            "if {service}.endswith('/_action/cancel_goal') and 'goal_id' in {data}:\n".format(service=service_expr, data=data_dict_name), #controllo che finisca in canel goal la richiesta e il goal_id sia presente in memoria
+            "if {service}.endswith('/_action/cancel_goal'):\n".format(service=service_expr),
             "    cancel_service = {data}.get('action_name', {service}.replace('/_action/cancel_goal', '')) + '/_action/cancel_goal'\n".format(data=data_dict_name, service=service_expr), #costruisce la cancel
             "    if cancel_service in {srvdict}:\n".format(srvdict=self.config_client_srvs_dict_name), # verifica che il monitor abbia un client per inviare il messaggio
-            "        cancel_request = CancelGoal.Request()\n", #crea richiesta
-            "        rosidl_runtime_py.set_message_fields(cancel_request, {{'goal_info': {{'goal_id': {data}['goal_id']}}}})\n".format(data=data_dict_name), #inserisce goal_id
-            "        {srvdict}[cancel_service].call_service(cancel_request)\n".format(srvdict=self.config_client_srvs_dict_name), #la invia
+            "        cancel_goal_info = {data}.get('cancel_goal_info')\n".format(data=data_dict_name),
+            "        if isinstance(cancel_goal_info, dict):\n",
+            "            cancel_request = CancelGoal.Request()\n",
+            "            rosidl_runtime_py.set_message_fields(cancel_request, {'goal_info': cancel_goal_info})\n",
+            "            {srvdict}[cancel_service].call_service(cancel_request)\n".format(srvdict=self.config_client_srvs_dict_name),
+            "        elif 'goal_id' in {data}:\n".format(data=data_dict_name),
+            "            cancel_request = CancelGoal.Request()\n",
+            "            rosidl_runtime_py.set_message_fields(cancel_request, {{'goal_info': {{'goal_id': {data}['goal_id']}}}})\n".format(data=data_dict_name),
+            "            {srvdict}[cancel_service].call_service(cancel_request)\n".format(srvdict=self.config_client_srvs_dict_name),
         ]
         return lines
 
